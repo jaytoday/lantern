@@ -1,5 +1,7 @@
 #!/bin/bash
 IFS=$'\n\t'
+YELLOW='\033[0;33m'
+RESET_COLOR='\033[0m'
 
 TESTDB=testdb
 PSQL=psql
@@ -7,6 +9,7 @@ TMP_ROOT=/tmp/lantern
 TMP_OUTDIR=$TMP_ROOT/tmp_output
 FILTER="${FILTER:-}"
 EXCLUDE="${EXCLUDE:-}"
+DB_PORT="${DB_PORT:-5432}"
 # $USER is not set in docker containers, so use whoami
 DEFAULT_USER=$(whoami)
 
@@ -69,43 +72,36 @@ then
 fi
 
 # Check if pgvector is available
-pgvector_installed=$($PSQL -U $DB_USER -d postgres -c "SELECT 1 FROM pg_available_extensions WHERE name = 'vector'" -tA | tail -n 1 | tr -d '\n')
+pgvector_installed=$($PSQL -U $DB_USER -p $DB_PORT -d postgres -c "SELECT 1 FROM pg_available_extensions WHERE name = 'vector'" -tA | tail -n 1 | tr -d '\n')
+lantern_extras_installed=$($PSQL -U $DB_USER -p $DB_PORT -d postgres -c "SELECT 1 FROM pg_available_extensions WHERE name = 'lantern_extras'" -tA | tail -n 1 | tr -d '\n')
 
 # Settings
 REGRESSION=0
 PARALLEL=0
+MISC=0
 C_TESTS=0
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --regression) REGRESSION=1 ;;
         --parallel) PARALLEL=1 ;;
+        --misc) MISC=1 ;;
         --client) C_TESTS=1 ;;
     esac
     shift
 done
 
 if [ "$C_TESTS" -eq 1 ]; then
-    DB_USER=$DB_USER TEST_DB_NAME=$TESTDB ./bin/lantern_c_tests
+    DB_USER=$DB_USER DB_PORT=$DB_PORT REPLICA_PORT=$REPLICA_PORT TEST_DB_NAME=$TESTDB ENABLE_REPLICA=$ENABLE_REPLICA ./bin/lantern_c_tests
     exit $?
 fi
 
 FIRST_TEST=1
 function print_test {
-    if [ "$PARALLEL" -eq 1 ]; then
-        if [ $1 == end ]; then
-            echo -e "\ntest: $1" >> $2
-        elif [ $1 == begin ]; then
-            echo -e "\ntest: $1" >> $2
-        else
-            if [ "$FIRST_TEST" -eq 1 ]; then
-                echo -n "test: $1" >> $2
-                FIRST_TEST=0
-            else
-                echo -n " $1" >> $2
-            fi
-        fi
+    if [ "$FIRST_TEST" -eq 1 ]; then
+        echo -en "\ntest: $1" >> $2
+        FIRST_TEST=0
     else
-        echo "test: $1" >> $2
+        echo -n " $1" >> $2
     fi
 }
 
@@ -113,21 +109,52 @@ function print_test {
 rm -rf $TMP_OUTDIR/schedule.txt
 if [ "$PARALLEL" -eq 1 ]; then
     SCHEDULE='parallel_schedule.txt'
+elif [ "$MISC" -eq 1 ]; then
+    SCHEDULE='misc_schedule.txt'
 else
     SCHEDULE='schedule.txt'
 fi
+
 if [[ -n "$FILTER" || -n "$EXCLUDE" ]]; then
     if [ "$PARALLEL" -eq 1 ]; then
-    	TEST_FILES=$(cat $SCHEDULE | grep -E '^(test:|test_begin:|test_end:)' | sed -E -e 's/^test:|test_begin:|test_end://' | tr " " "\n" | sed -e '/^$/d')
+    	TEST_FILES=$(cat $SCHEDULE | grep -E '^(test:|test_begin:|test_end:)' | sed -E -e 's/^test_begin:|test_end:/test:/' | tr " " "\n" | sed -e '/^$/d')
+
+        # begin.sql isn't really optional. There may be cases where we want to drop it, but users should probably have to be very explicit about this
+        INCLUDE_BEGIN=1
+        if [[ "begin" != *"$FILTER"* ]]; then
+            while true; do
+                read -p "[33m Warning: you have excluded the 'begin' script this will likely cause tests to fail. Would you like to include it [y/n] [0m" response
+                case $response in
+                    [Nn]* ) INCLUDE_BEGIN=0; 
+                        echo -e "${YELLOW} !!!Proceeding without initialization SQL!!! ${RESET_COLOR}";
+                        break
+                        ;;
+                    [Yy]* ) break;;
+                    * ) echo "Unrecognized input";;
+                esac
+            done
+            if [ "$INCLUDE_BEGIN" -eq 1 ]; then
+                print_test "begin" $TMP_OUTDIR/schedule.txt $FIRST_TEST
+                $FIRST_TEST=1
+            fi
+        fi
     else
+        NEWLINE=$'\n'
+        TEST_FILES=$(cat $SCHEDULE | grep '^test:' | tr " " "\n" | sed -e '/^$/d')
         if [[ "$pgvector_installed" == "1" ]]; then
-            TEST_FILES=$(cat $SCHEDULE | grep -E '^(test:|test_pgvector:)' | sed -E -e 's/^test:|test_pgvector://' | tr " " "\n" | sed -e '/^$/d')
-        else
-            TEST_FILES=$(cat $SCHEDULE | grep '^test:' | sed -e 's/^test://' | tr " " "\n" | sed -e '/^$/d')
+            TEST_FILES="${TEST_FILES}${NEWLINE}$(cat $SCHEDULE | grep -E '^(test_pgvector:)' | sed -e 's/^test_pgvector:/test:/' | tr " " "\n" | sed -e '/^$/d')"
+        fi
+
+        if [[ "$lantern_extras_installed" ]]; then
+            TEST_FILES="${TEST_FILES}${NEWLINE}$(cat $SCHEDULE | grep -E '^(test_extras:)' | sed -e 's/^test_extras:/test:/' | tr " " "\n" | sed -e '/^$/d')"
         fi
     fi
 
     while IFS= read -r f; do
+        if [ "$f" == "test:" ]; then
+            FIRST_TEST=1
+            continue
+        fi
         if [ -n "$FILTER" ]; then
             if [[ $f == *"$FILTER"* ]]; then
                 print_test $f $TMP_OUTDIR/schedule.txt $FIRST_TEST
@@ -146,10 +173,20 @@ if [[ -n "$FILTER" || -n "$EXCLUDE" ]]; then
         exit 0
     fi
 else
+    if [ "$MISC" -eq 1 ]; then
+        echo "misc tests are not intended to be run in parallel, please include a FILTER"
+        exit 1
+    fi
+
     while IFS= read -r line; do
         if [[ "$line" =~ ^test_pgvector: ]]; then
             test_name=$(echo "$line" | sed -e 's/test_pgvector://')
             if [ "$pgvector_installed" == "1" ]; then
+                echo "test: $test_name" >> $TMP_OUTDIR/schedule.txt
+            fi
+        elif [[ "$line" =~ ^test_extras: ]]; then
+            test_name=$(echo "$line" | sed -e 's/test_extras://')
+            if [ "$lantern_extras_installed" == "1" ]; then
                 echo "test: $test_name" >> $TMP_OUTDIR/schedule.txt
             fi
         elif [[ "$line" =~ ^test_begin: ]]; then
@@ -163,7 +200,7 @@ else
         fi
     done < $SCHEDULE
 fi
-unset $SCHEDULE
+unset SCHEDULE
 SCHEDULE=$TMP_OUTDIR/schedule.txt
 
 function print_diff {
@@ -182,7 +219,10 @@ trap print_diff ERR
 
 if [ "$PARALLEL" -eq 1 ]; then
     cd parallel
-    PARALLEL=$PARALLEL DB_USER=$DB_USER $(pg_config --pkglibdir)/pgxs/src/test/regress/pg_regress --user=$DB_USER --schedule=$SCHEDULE --outputdir=$TMP_OUTDIR --launcher=../test_runner.sh
+    MISC=$MISC PARALLEL=$PARALLEL DB_USER=$DB_USER $(pg_config --pkglibdir)/pgxs/src/test/regress/pg_regress --user=$DB_USER --schedule=$SCHEDULE --outputdir=$TMP_OUTDIR --launcher=../test_runner.sh
+elif [ "$MISC" -eq 1 ]; then
+    cd misc
+    MISC=$MISC PARALLEL=$PARALLEL DB_USER=$DB_USER $(pg_config --pkglibdir)/pgxs/src/test/regress/pg_regress --user=$DB_USER --schedule=$SCHEDULE --outputdir=$TMP_OUTDIR --launcher=../test_runner.sh
 else
-    PARALLEL=$PARALLEL DB_USER=$DB_USER $(pg_config --pkglibdir)/pgxs/src/test/regress/pg_regress --user=$DB_USER --schedule=$SCHEDULE --outputdir=$TMP_OUTDIR --launcher=./test_runner.sh
+    MISC=$MISC PARALLEL=$PARALLEL DB_USER=$DB_USER $(pg_config --pkglibdir)/pgxs/src/test/regress/pg_regress --user=$DB_USER --schedule=$SCHEDULE --outputdir=$TMP_OUTDIR --launcher=./test_runner.sh
 fi
